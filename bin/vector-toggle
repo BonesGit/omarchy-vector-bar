@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""vector-toggle: launch / show / hide the Vector chat window.
+
+Flags: --show (never hide), --hide (never show; park if visible),
+--dock (re-anchor top-right on the focused monitor; show first if parked),
+--apply (push pin/paddings — and size when --width/--height are passed),
+--remember (snapshot live size into settings.json + window-state;
+            optional --width/--height when the window is already gone).
+One invocation per bar-button click (no flags = toggle):
+  no window  -> launch the app: make sure the runtime float rule is in
+                place, seed the app's window-state file with the configured
+                size (it restores geometry at launch and ignores compositor
+                resizes), anchor top-right, focus. Size is seeded at launch
+                from settings.json (updated when you hide after a manual
+                resize); position is re-anchored when the window hops to a
+                different monitor. Same-monitor hide/show keeps a drag.
+  parked     -> SHOW: move to the focused monitor's active workspace,
+                keep the position the user last had if that monitor is
+                the same one; re-anchor top-right when crossing monitors
+                (Hyprland keeps monitor-relative x/y, so a top-right on a
+                narrow/rotated display lands mid-screen on a wide one),
+                then focus
+  visible on the focused monitor
+             -> HIDE: park on special:vector-bar (special workspace, not
+                toggled open). The Tauri process keeps running, so the
+                Nostr connection stays up.
+  visible on a different monitor
+             -> MOVE: jump to the focused monitor's active workspace,
+                re-anchor top-right, focus (do not hide — one click hops).
+
+Hide: Hyprland has no minimize. special:vector-bar (untoggled) parks the
+window off-screen without a bar chip. The `pin` setting (default true)
+pins while visible so it stays across workspace switches; pin blocks
+moves onto the special workspace, so hide always unpins first and
+show/hop re-apply the setting.
+
+Multi-monitor: "show" lands on whichever monitor has keyboard focus (the
+one you clicked the bar button on). The anchor is computed from the
+VISUAL geometry of the monitor the window ends up on. `monitors -j`
+reports native mode sizes, which is wrong for rotated monitors, so the
+per-monitor visual rect is read from the full-screen omarchy-background
+layer surface instead.
+
+Launch binary: setting `command` if set, else PATH (`Vector`), else a
+Vector*.desktop Exec=, else a Vector*.AppImage under common locations.
+"""
+import fcntl
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+CLASS = "Vector"
+# Untoggled special workspace used as a minimize stand-in (never
+# togglespecialworkspace — only window.move here). Named for this plugin so
+# it does not collide with a user special:vector.
+PARK_WS = "special:vector-bar"
+SETTINGS_ID = "io.github.bonesgit.omarchy-vector-bar"
+_OLD_SETTINGS_ID = "io.github.bonesgit.omarchy-vector"
+# Plugin-owned settings (command, size, paddings, pin). Not shell.json —
+# that file only holds the bar layout stub `{ "id": ... }`.
+SETTINGS_FILE = os.path.expanduser(
+    "~/.config/io.github.bonesgit.omarchy-vector-bar/settings.json"
+)
+# Pre-rename settings path; migrated into SETTINGS_FILE on first load.
+_LEGACY_SETTINGS_FILE = os.path.expanduser(
+    "~/.config/io.github.bonesgit.omarchy-vector/settings.json"
+)
+# Legacy size-only file from an earlier build; migrated into SETTINGS_FILE.
+_LEGACY_SIZE_STATE = os.path.expanduser(
+    "~/.local/state/io.github.bonesgit.omarchy-vector/size.json"
+)
+# Vector (Tauri + tauri-plugin-window-state) restores its window geometry
+# from this file at launch and ignores compositor resizes, so the configured
+# size is seeded here before spawn. The app does not reliably write an
+# interactive resize back into this file; remember_size() snapshots the
+# live Hyprland size into SETTINGS_FILE + this file whenever we hide.
+STATE_FILE = os.path.expanduser("~/.config/io.vectorapp/.window-state.json")
+# Runtime window-rule name (injected at launch, upserted by name — see
+# ensure_float_rule). Not in any config file: the plugin is the driver.
+RULE_NAME = "omarchy-vector-float"
+# Serialize concurrent clicks / --remember children so launch/hide/apply
+# cannot interleave. Held for the process lifetime (refcount keeps the fd).
+LOCK_PATH = os.path.expanduser("~/.cache/omarchy/vector-toggle.lock")
+_lock_fp = None
+DEFAULTS = {
+    "width": 385,
+    "height": 640,
+    "topPadding": 32,
+    "rightPadding": 6,
+    "pin": True,
+    "command": "",
+}
+
+
+def acquire_lock():
+    """Block until this process owns the exclusive toggle lock."""
+    global _lock_fp
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    _lock_fp = open(LOCK_PATH, "a+")
+    fcntl.flock(_lock_fp.fileno(), fcntl.LOCK_EX)
+
+
+def sh(args):
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def hyprj(*args):
+    out = sh(["hyprctl", *args, "-j"]).stdout
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def eva(lua):
+    r = sh(["hyprctl", "eval", lua])
+    if r.returncode != 0 or "error" in r.stdout.lower():
+        log("dispatch failed: %s :: %s" % (lua, r.stdout.strip()[:200]))
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.expanduser("~/.cache/omarchy"), exist_ok=True)
+        with open(os.path.expanduser("~/.cache/omarchy/vector-toggle.log"), "a") as f:
+            f.write("%s ppid=%s %s\n" % (time.strftime("%H:%M:%S"), os.getppid(), msg))
+    except Exception:
+        pass
+
+
+def _as_int(v):
+    """Coerce a JSON number to int; reject bool (subclass of int)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        return int(round(v))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _merge_settings_dict(dst, src):
+    """Copy known keys from src into dst with type checks."""
+    if not isinstance(src, dict):
+        return dst
+    for k, default in DEFAULTS.items():
+        v = src.get(k)
+        if isinstance(default, bool):
+            if isinstance(v, bool):
+                dst[k] = v
+        elif isinstance(default, str):
+            if isinstance(v, str):
+                dst[k] = v
+        else:
+            n = _as_int(v)
+            if n is not None:
+                dst[k] = n
+    return dst
+
+
+def _legacy_shell_entry():
+    """Settings keys previously stored on the bar layout entry, if any."""
+    try:
+        with open(os.path.expanduser("~/.config/omarchy/shell.json")) as f:
+            d = json.load(f)
+        found_old = None
+        for entries in (d.get("bar", {}).get("layout") or {}).values():
+            for e in entries or []:
+                if not isinstance(e, dict):
+                    continue
+                eid = e.get("id")
+                if eid == SETTINGS_ID:
+                    return e
+                if eid == _OLD_SETTINGS_ID and found_old is None:
+                    found_old = e
+        return found_old
+    except Exception:
+        pass
+    return None
+
+
+def _migrate_legacy_settings():
+    """Build settings from older paths / shell.json / size.json once."""
+    s = dict(DEFAULTS)
+    old_file = _read_json(_LEGACY_SETTINGS_FILE)
+    if isinstance(old_file, dict):
+        _merge_settings_dict(s, old_file)
+    else:
+        _merge_settings_dict(s, _legacy_shell_entry())
+        legacy_size = _read_json(_LEGACY_SIZE_STATE)
+        if isinstance(legacy_size, dict):
+            w, h = _as_int(legacy_size.get("width")), _as_int(legacy_size.get("height"))
+            if w is not None and h is not None and w > 0 and h > 0:
+                s["width"], s["height"] = w, h
+    has_legacy = (
+        isinstance(old_file, dict)
+        or os.path.isfile(_LEGACY_SIZE_STATE)
+        or _legacy_shell_entry() is not None
+    )
+    if s == DEFAULTS and not has_legacy:
+        return None
+    if write_settings(s):
+        for path in (_LEGACY_SETTINGS_FILE, _LEGACY_SIZE_STATE):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        log("migrated settings to %s" % SETTINGS_FILE)
+        return s
+    return None
+
+
+def write_settings(s):
+    """Atomically write the plugin settings file (DEFAULTS keys only)."""
+    out = dict(DEFAULTS)
+    _merge_settings_dict(out, s)
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(out, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, SETTINGS_FILE)
+        return True
+    except Exception as e:
+        log("settings write failed: %s" % e)
+        return False
+
+
+def load_settings():
+    """Read ~/.config/io.github.bonesgit.omarchy-vector-bar/settings.json."""
+    s = dict(DEFAULTS)
+    d = _read_json(SETTINGS_FILE)
+    if isinstance(d, dict):
+        return _merge_settings_dict(s, d)
+    migrated = _migrate_legacy_settings()
+    if isinstance(migrated, dict):
+        return migrated
+    return s
+
+
+def _executable(path):
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _parse_desktop_exec(path):
+    """Return the first argv token of Exec= from a .desktop file, or None."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if not line.startswith("Exec="):
+                    continue
+                raw = line[5:].strip()
+                # Drop field codes and split; keep a quoted path intact enough
+                # for typical AppImage/absolute Exec lines.
+                for code in ("%u", "%U", "%f", "%F", "%i", "%c", "%k"):
+                    raw = raw.replace(code, "")
+                raw = raw.strip()
+                if raw.startswith('"'):
+                    end = raw.find('"', 1)
+                    token = raw[1:end] if end > 0 else raw.strip('"')
+                else:
+                    token = raw.split()[0] if raw else ""
+                token = os.path.expanduser(token)
+                return token or None
+    except Exception:
+        return None
+    return None
+
+
+def resolve_app_bin(settings):
+    """Locate the Vector binary for launch (portable across installs).
+
+    Order: plugin setting `command`, PATH (`Vector` / `vector`), Vector*.desktop
+    Exec=, then Vector*.AppImage under common user locations.
+    """
+    cmd = (settings.get("command") or "").strip()
+    if cmd:
+        expanded = os.path.expanduser(cmd)
+        if os.path.sep in expanded or expanded.startswith("."):
+            if _executable(expanded):
+                return os.path.abspath(expanded)
+        else:
+            found = shutil.which(expanded)
+            if found:
+                return found
+        log("setting command not executable: %s" % cmd)
+
+    for name in ("Vector", "vector"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    desk_dirs = [
+        os.path.expanduser("~/.local/share/applications"),
+        "/usr/local/share/applications",
+        "/usr/share/applications",
+    ]
+    desk_names = ("Vector.desktop", "vector.desktop", "Vector-handler.desktop")
+    for d in desk_dirs:
+        for name in desk_names:
+            path = os.path.join(d, name)
+            if not os.path.isfile(path):
+                continue
+            exe = _parse_desktop_exec(path)
+            if _executable(exe):
+                return exe
+
+    home = os.path.expanduser("~")
+    patterns = [
+        os.path.join(home, "Applications", "Vector*.AppImage"),
+        os.path.join(home, ".local", "bin", "Vector*.AppImage"),
+        os.path.join(home, ".local", "bin", "Vector"),
+        "/opt/Vector*.AppImage",
+        "/opt/vector/Vector",
+    ]
+    candidates = []
+    for pat in patterns:
+        for path in glob.glob(pat):
+            if _executable(path):
+                candidates.append(path)
+    if candidates:
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return candidates[0]
+
+    return None
+
+
+def notify_missing_bin():
+    msg = (
+        "Vector not found. Install it, add Vector to PATH, or set the plugin "
+        "`command` setting to your binary/AppImage."
+    )
+    log(msg)
+    sh(["hyprctl", "notify", "-1", "6000", "rgb(ff5555)", msg])
+
+
+def find_window():
+    for c in hyprj("clients") or []:
+        if c.get("class") == CLASS:
+            return c
+    return None
+
+
+def monitors():
+    return hyprj("monitors") or []
+
+
+def monitor_visuals():
+    """{monitor_id: (x0, y0, w, h)} in visual pixels, per monitor."""
+    out = {}
+    name2id = {m.get("name"): m.get("id") for m in monitors()}
+    for name, info in (hyprj("layers") or {}).items():
+        mid = name2id.get(name)
+        if mid is None:
+            continue
+        for level in (info.get("levels") or {}).values():
+            for srf in level or []:
+                if srf.get("namespace") == "omarchy-background":
+                    out[mid] = (srf["x"], srf["y"], srf["w"], srf["h"])
+                    break
+    return out
+
+
+def focused_monitor():
+    """(monitor_id, active_workspace_id) of the monitor holding keyboard focus."""
+    for m in monitors():
+        if m.get("focused"):
+            aw = m.get("activeWorkspace")
+            aw_id = aw.get("id") if isinstance(aw, dict) else aw
+            return m.get("id"), aw_id
+    return None, None
+
+
+def ws_name(c):
+    w = c.get("workspace") or {}
+    return w.get("name", "") if isinstance(w, dict) else str(w)
+
+
+def anchor_xy(c, s, monitor_id):
+    """Top-right absolute coords for c's size on monitor_id's visual rect."""
+    g = monitor_visuals().get(monitor_id)
+    if not g:
+        return None
+    w = c.get("size", [s["width"], s["height"]])[0]
+    return g[0] + g[2] - w - s["rightPadding"], g[1] + s["topPadding"]
+
+
+def place(c, s, monitor_id=None):
+    """Anchor the floating window top-right below the bar.
+
+    monitor_id defaults to the window's current monitor. Prefer hop_to() when
+    crossing monitors — a bare place onto another monitor before move_to gets
+    remapped by the subsequent monitor assign.
+    """
+    xy = anchor_xy(c, s, c.get("monitor") if monitor_id is None else monitor_id)
+    if not xy:
+        return
+    eva(
+        'hl.dispatch(hl.dsp.window.move({ x = %d, y = %d, window = "address:%s" }))'
+        % (xy[0], xy[1], c["address"])
+    )
+
+
+def hop_to(c, s, mon_id, aw_id):
+    """Move to mon_id's active workspace and anchor top-right in one step.
+
+    Order matters: workspace/monitor first, then absolute place. Place-then-
+    assign looks right briefly but Hyprland remaps on the monitor change and
+    leaves a wrong final spot. Animations are off for the
+    batch so the intermediate monitor-relative remap never paints — that was
+    the cross-monitor mid-screen stutter.
+    """
+    xy = anchor_xy(c, s, mon_id)
+    if not xy:
+        move_to(str(aw_id), c, monitor=mon_id)
+        return
+    eva(
+        'local a = hl.get_config("animations.enabled")\n'
+        'hl.config({ animations = { enabled = false } })\n'
+        'hl.dispatch(hl.dsp.window.move({ workspace = "%s", monitor = %d, '
+        'window = "address:%s", follow = false }))\n'
+        'hl.dispatch(hl.dsp.window.move({ x = %d, y = %d, window = "address:%s" }))\n'
+        'hl.config({ animations = { enabled = a } })'
+        % (aw_id, mon_id, c["address"], xy[0], xy[1], c["address"])
+    )
+
+
+def ensure_float_rule(pin=True):
+    """Make sure the runtime window rule that floats Vector is in place
+    BEFORE the window maps, so it comes up floating at the size the app
+    requested (without a rule it maps tiled, and the tile->float transition
+    keeps the tile size — this build's float/resize dispatchers cannot set a
+    size). pin follows the plugin setting (default on).
+
+    Injected from the plugin, not from any Hyprland config file: it is a
+    named rule, so relaunches upsert it instead of stacking, and it is
+    re-injected after a Hyprland restart (runtime rules don't survive one).
+    Also keeps Omarchy's o.floating_apps registry in sync, as o.window would.
+    """
+    lua = r"""
+local have = false
+for _, p in ipairs(o.floating_apps.class) do
+  if p == "^Vector$" then have = true end
+end
+hl.window_rule({ name = "%s", match = { class = "^Vector$" }, float = true, pin = %s, enabled = true })
+if not have then
+  o.floating_apps.class[#o.floating_apps.class + 1] = "^Vector$"
+  if o.floating_apps_changed then o.floating_apps_changed() end
+end
+""" % (RULE_NAME, "true" if pin else "false")
+    r = sh(["hyprctl", "eval", lua])
+    if r.returncode != 0 or "error" in r.stdout.lower():
+        log("float rule failed: %s" % r.stdout.strip()[:200])
+
+
+def float_window(c):
+    """Fallback: float a window that mapped tiled (rule missing). Toggles,
+    so only call when the window is not already floating."""
+    eva('hl.dispatch(hl.dsp.window.float({ window = "address:%s" }))' % c["address"])
+
+
+def set_pin(c, want):
+    """Pin or unpin. hl.dsp.window.pin toggles; only dispatch when needed.
+
+    Pinned floating windows stay visible across workspace switches (Omarchy
+    window-pop / PiP). They refuse moves onto special workspaces, so hide
+    must unpin first.
+    """
+    if not c:
+        return
+    if bool(c.get("pinned")) == bool(want):
+        return
+    eva('hl.dispatch(hl.dsp.window.pin({ window = "address:%s" }))' % c["address"])
+
+
+def move_to(ws, c, monitor=None):
+    mon = ", monitor = %d" % monitor if monitor is not None else ""
+    eva(
+        'hl.dispatch(hl.dsp.window.move({ workspace = "%s"%s, window = "address:%s", follow = false }))'
+        % (ws, mon, c["address"])
+    )
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _seed_state(w, h):
+    """Point the window-state file at w x h so the app spawns at that size.
+
+    Only touches the "main" entry; per-miniapp state is preserved. Runs
+    before spawn, while the app is not running and the file is unheld.
+
+    A fresh file needs the full key set the app itself writes — with only
+    width/height present the plugin skips the restore and the app falls
+    back to its own Tauri default size.
+    """
+    d = _read_json(STATE_FILE) or {}
+    m = d.get("main") or {
+        "x": 0, "y": 0, "prev_x": 0, "prev_y": 0,
+        "maximized": False, "visible": True,
+        "decorated": False, "fullscreen": False,
+    }
+    m.update({"width": w, "height": h, "maximized": False, "visible": True})
+    d["main"] = m
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log("state write failed: %s" % e)
+
+
+def focus(c):
+    # Keyboard focus does not require moving the pointer. Hyprland's focus
+    # dispatcher warps the cursor into the window by default; suppress that
+    # for this call so the pointer stays on the bar pill after a click.
+    # Save/restore no_warps so we do not clobber the user's global preference
+    # (same pattern as hop_to with animations.enabled).
+    eva(
+        'local nw = hl.get_config("cursor.no_warps")\n'
+        'hl.config({ cursor = { no_warps = true } })\n'
+        'hl.dispatch(hl.dsp.focus({ window = "address:%s" }))\n'
+        'hl.config({ cursor = { no_warps = nw } })'
+        % c["address"]
+    )
+
+
+def client_size(c):
+    """(width, height) from a hyprctl client, or None."""
+    sz = c.get("size") if c else None
+    if not isinstance(sz, (list, tuple)) or len(sz) < 2:
+        return None
+    try:
+        w, h = int(sz[0]), int(sz[1])
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return w, h
+
+
+def persist_size(w, h):
+    """Update width/height in settings.json and seed Vector's window-state."""
+    _seed_state(w, h)
+    s = load_settings()
+    if s.get("width") == w and s.get("height") == h:
+        return True
+    s["width"] = int(w)
+    s["height"] = int(h)
+    return write_settings(s)
+
+
+def remember_wh(w, h, s=None):
+    """Persist an explicit width/height for the next launch."""
+    if w <= 0 or h <= 0:
+        return False
+    if s is None:
+        s = load_settings()
+    if s.get("width") == w and s.get("height") == h:
+        # Already the effective size; still keep Vector's state file aligned.
+        _seed_state(w, h)
+        return False
+    if persist_size(w, h):
+        log("remember size %dx%d (was %sx%s)" % (
+            w, h, s.get("width"), s.get("height")))
+        return True
+    return False
+
+
+def remember_wh_bg(w, h):
+    """Seed Vector window-state now; push settings.json in a detached child.
+
+    Used from hide() so parking is never blocked on settings I/O.
+    """
+    _seed_state(w, h)
+    s = load_settings()
+    if s.get("width") == w and s.get("height") == h:
+        return
+    subprocess.Popen(
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--remember",
+            "--width", str(w),
+            "--height", str(h),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def remember_size(c, s=None):
+    """Snapshot a Vector window's size for the next launch.
+
+    Vector's window-state plugin does not reliably record interactive
+    resizes, so we copy Hyprland's size into SETTINGS_FILE + STATE_FILE.
+    Size is still valid while parked on special:vector-bar.
+    """
+    if not c:
+        return False
+    size = client_size(c)
+    if not size:
+        return False
+    return remember_wh(size[0], size[1], s)
+
+
+def hide(c):
+    """Unpin (pin blocks special moves) and park on PARK_WS. No-op if absent."""
+    if not c:
+        return
+    # Read size first (cheap), park immediately, persist settings off-path.
+    size = client_size(c)
+    set_pin(c, False)
+    c = find_window() or c
+    move_to(PARK_WS, c)
+    if size:
+        remember_wh_bg(size[0], size[1])
+
+
+def try_resize(c, w, h):
+    """Best-effort compositor resize. Vector may ignore it until relaunch."""
+    if not c or w <= 0 or h <= 0:
+        return
+    eva(
+        'hl.dispatch(hl.dsp.window.resize({ x = %d, y = %d, window = "address:%s" }))'
+        % (int(w), int(h), c["address"])
+    )
+
+
+def parse_apply_flags(argv):
+    """Pull settings flags from argv (--pin/--command/--width/…)."""
+    out = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in (
+            "--pin", "--command", "--width", "--height",
+            "--top-padding", "--right-padding",
+        ) and i + 1 < len(argv):
+            val = argv[i + 1]
+            if a == "--pin":
+                out["pin"] = val in ("1", "true", "True", "yes", "on")
+            elif a == "--command":
+                out["command"] = val
+            else:
+                key = {
+                    "--width": "width",
+                    "--height": "height",
+                    "--top-padding": "topPadding",
+                    "--right-padding": "rightPadding",
+                }[a]
+                try:
+                    out[key] = int(val)
+                except ValueError:
+                    pass
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def apply_settings(s, resize=False):
+    """Push settings onto the live window.
+
+    resize=True also seeds Vector's STATE_FILE and asks the compositor to
+    resize. Pin/padding-only applies must leave a manual resize alone.
+    Caller persists s to SETTINGS_FILE before calling.
+    """
+    ensure_float_rule(s["pin"])
+    if resize:
+        _seed_state(s["width"], s["height"])
+    c = find_window()
+    if not c or ws_name(c) == PARK_WS:
+        if resize:
+            log("apply: no visible window (seeded size / float rule only)")
+        else:
+            log("apply: no visible window (float rule only)")
+        return
+    if resize:
+        try_resize(c, s["width"], s["height"])
+        time.sleep(0.05)
+        c = find_window() or c
+    # Anchor with the window's real size (Vector often ignores compositor
+    # resize until relaunch). Paddings still apply against what is on screen.
+    place(c, s, c.get("monitor"))
+    set_pin(c, s["pin"])
+    log("apply: pin=%s pad=%s/%s resize=%s want=%sx%s got=%s" % (
+        s["pin"], s["topPadding"], s["rightPadding"], resize,
+        s["width"], s["height"], c.get("size")))
+
+
+_FLAG_KEYS = (
+    "--pin", "--command", "--width", "--height",
+    "--top-padding", "--right-padding",
+)
+
+
+def main():
+    # --show: never hide; show if parked, focus if visible.
+    # --hide: never show; park if visible (used by Escape / keybinds).
+    # --dock: re-anchor to top-right on the focused monitor (settings paddings).
+    # --apply: persist flags to settings.json + live-push pin/paddings (/size).
+    # --remember: snapshot the live window size into settings.json + STATE_FILE.
+    acquire_lock()
+    argv = sys.argv[1:]
+    show_only = "--show" in argv
+    hide_only = "--hide" in argv
+    dock_only = "--dock" in argv
+    apply_only = "--apply" in argv
+    remember_only = "--remember" in argv
+    extra = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in _FLAG_KEYS:
+            i += 2
+            continue
+        if a not in ("--show", "--hide", "--dock", "--apply", "--remember"):
+            extra.append(a)
+        i += 1
+    apply_flags = parse_apply_flags(argv)
+    s = load_settings()
+    s.update(apply_flags)
+    c = find_window()
+    state = "no-window" if c is None else "%s/mon%d" % (ws_name(c), c.get("monitor", -1))
+    log("invoke state=%s show=%s hide=%s dock=%s apply=%s remember=%s" % (
+        state, show_only, hide_only, dock_only, apply_only, remember_only))
+
+    if remember_only:
+        # Optional --width/--height: persist without a live client (quit path).
+        # Compare against settings on disk (load_settings), not s — s already
+        # has the flag overrides merged in.
+        if "width" in apply_flags and "height" in apply_flags:
+            remember_wh(apply_flags["width"], apply_flags["height"], load_settings())
+        else:
+            remember_size(c, load_settings())
+        return
+
+    if apply_only:
+        # Persist first so launch/next click sees the same values. Only stomp
+        # live geometry when this apply explicitly set width/height.
+        write_settings(s)
+        apply_settings(s, resize=("width" in apply_flags or "height" in apply_flags))
+        return
+
+    if hide_only:
+        if c and ws_name(c) != PARK_WS:
+            hide(c)
+        return
+
+    if dock_only:
+        mon_id, aw_id = focused_monitor()
+        if aw_id is None:
+            return
+        if c is None:
+            sh([
+                "hyprctl", "notify", "-1", "4000", "rgb(ff5555)",
+                "Vector is not running — open it from the bar first.",
+            ])
+            return
+        if ws_name(c) == PARK_WS or c.get("monitor") != mon_id:
+            hop_to(c, s, mon_id, aw_id)
+        else:
+            place(c, s, mon_id)
+        c = find_window()
+        if c:
+            set_pin(c, s["pin"])
+            focus(c)
+        return
+
+    if c is None:
+        # Size: the app restores geometry from its window-state file at
+        # launch (compositor resizes are ignored), so we seed that file
+        # with the configured size. The anchor happens only here, at
+        # launch; afterwards show/hide never touch the geometry.
+        app_bin = resolve_app_bin(s)
+        if not app_bin:
+            notify_missing_bin()
+            return
+        log("launch %s" % app_bin)
+        ensure_float_rule(s["pin"])
+        _seed_state(s["width"], s["height"])
+        subprocess.Popen(
+            [app_bin, *extra],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        c = None
+        for _ in range(50):
+            time.sleep(0.2)
+            c = find_window()
+            if c:
+                break
+        if c:
+            # The rule maps it floating (+pinned when setting on); fix up if not.
+            if not c.get("floating"):
+                float_window(c)
+            time.sleep(0.3)  # let it settle
+            c = find_window()
+            if c:
+                # Anchor against the window's actual size.
+                place(c, s)
+                set_pin(c, s["pin"])
+                focus(c)
+        return
+
+    mon_id, aw_id = focused_monitor()
+    if aw_id is None:
+        return
+
+    if ws_name(c) == PARK_WS:
+        # SHOW: onto the focused monitor's active workspace. Same-monitor
+        # show keeps the last drag position; cross-monitor show re-anchors
+        # in one hop (place-then-assign — see hop_to).
+        prev_mon = c.get("monitor")
+        if prev_mon != mon_id:
+            log("show cross-monitor %s -> %s; re-anchor" % (prev_mon, mon_id))
+            hop_to(c, s, mon_id, aw_id)
+        else:
+            move_to(str(aw_id), c, monitor=mon_id)
+            time.sleep(0.15)
+        c = find_window()
+        if c:
+            set_pin(c, s["pin"])
+            focus(c)
+        return
+
+    # Visible on some workspace.
+    if show_only and not extra:
+        set_pin(c, s["pin"])
+        focus(c)
+        return
+    if extra:
+        # Deep link while running: hand to the binary; the single-instance
+        # plugin forwards the args to the live process.
+        app_bin = resolve_app_bin(s)
+        if not app_bin:
+            notify_missing_bin()
+            return
+        subprocess.Popen(
+            [app_bin, *extra],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return
+
+    if c.get("monitor") != mon_id:
+        # Open elsewhere: hop here in one click instead of hiding.
+        log("hop %s -> mon%s; re-anchor" % (c.get("monitor"), mon_id))
+        hop_to(c, s, mon_id, aw_id)
+        c = find_window()
+        if c:
+            set_pin(c, s["pin"])
+            focus(c)
+        return
+
+    # Same monitor: HIDE — park it; the window stops rendering but the app
+    # keeps running.
+    hide(c)
+
+
+if __name__ == "__main__":
+    main()

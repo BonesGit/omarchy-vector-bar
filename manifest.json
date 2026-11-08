@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.bonesgit.omarchy-vector-bar",
+  "name": "Vector Bar",
+  "version": "0.1.0",
+  "author": "BonesGit",
+  "license": "MIT",
+  "description": "Omarchy bar widget that shows/hides the Vector Nostr chat as a floating popup on the focused monitor. The Vector app keeps running while hidden.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Vector Bar",
+    "description": "Show or hide Vector from the Omarchy bar. The app stays running while hidden. Appears on the monitor you are focused on. Position and size come from the plugin settings popup; a manual resize is saved when you hide or quit.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
